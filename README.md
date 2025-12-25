@@ -1,14 +1,14 @@
 # Dysarthria Detection Baseline (TORGO)
 
-This repository contains a simple baseline for dysarthria detection using the TORGO speech dataset. The goal is to establish a clear starting point using standard acoustic features and a classical machine learning model, while making the evaluation assumptions explicit.
+This repository implements a baseline system for dysarthria detection using the TORGO speech dataset. The goal is to establish a clear and reproducible starting point using standard acoustic features and a classical machine learning model, while being explicit about evaluation assumptions and limitations.
 
-The pipeline downloads TORGO via `kagglehub`, runs basic dataset sanity checks, extracts MFCC summary features from each audio file, and trains an RBF-kernel SVM classifier.
+The pipeline downloads TORGO via `kagglehub`, runs basic dataset sanity checks, extracts MFCC summary features from each audio file, and trains an RBF-kernel SVM classifier evaluated with a speaker-level train/test split.
 
 ## 1) Overview
 
 - **Task:** binary classification (control vs dysarthric speech)
-- **Input:** TORGO `.wav` files organized by speaker/session folders
-- **Output:** dataset statistics, quality scan summaries, and baseline classification metrics
+- **Input:** TORGO `.wav` files organized by speaker and session
+- **Output:** dataset statistics, audio quality summaries, and classification metrics
 - **Tools:** Python, `kagglehub`, `librosa`, NumPy, scikit-learn, matplotlib
 
 ## 2) Dataset (TORGO) and label mapping
@@ -29,6 +29,8 @@ Binary labels used throughout the code:
 - `0` = control (`F_Con`, `M_Con`)
 - `1` = dysarthric (`F_Dys`, `M_Dys`)
 
+Speaker IDs and microphone types are parsed directly from directory names.
+
 ## 3) Method
 
 ### Feature extraction
@@ -36,17 +38,19 @@ Binary labels used throughout the code:
 - Audio is loaded with `librosa` at 16 kHz (mono).
 - For each file, 13 MFCCs are computed.
 - MFCCs are summarized using the mean and standard deviation over time.
-- Final feature representation: **26 dimensions per file**.
+- Final feature representation: **26 dimensions per utterance**.
 
-This representation is intentionally simple and commonly used as a baseline in speech classification tasks.
+This feature set is intentionally simple and commonly used as a baseline in speech classification tasks.
 
 ### Model and evaluation
 
 - Features are standardized using `StandardScaler`.
 - Classifier: `SVC` with an RBF kernel (`C=1.0`, `gamma="scale"`).
-- Evaluation includes:
-  - A file-level stratified train/test split (80/20).
-  - File-level 5-fold cross-validation using ROC-AUC.
+- Evaluation uses a **speaker-level train/test split**:
+  - Speakers are randomly split (≈80% train, 20% test).
+  - All utterances from a given speaker appear only in one split.
+
+This setup avoids speaker leakage and provides a more realistic estimate of generalization to unseen speakers.
 
 ## 4) How to run
 
@@ -72,52 +76,49 @@ Notes:
 
 ## 5) What the script prints
 
-`main.py` outputs several checkpoints to make the process transparent:
+`main.py` prints intermediate results to make the pipeline transparent:
 
-- Dataset path and top-level directory contents.
+- Dataset path and top-level directory structure.
 - Number of `.wav` files per group (`F_Con`, `F_Dys`, `M_Con`, `M_Dys`).
 - Dataset-level sanity checks:
   - speaker ID overlap across groups (to detect label mixing)
-  - microphone type distribution inferred from folder names
+  - microphone type distribution inferred from directory names
 - Random audio quality scan (default: 50 files per group):
   - duration statistics (min / median / max)
   - counts of failed loads, near-silent clips, extreme durations, and clipping
   - example file paths flagged for inspection
 - Model outputs:
   - feature matrix shape
-  - Accuracy, ROC-AUC, and a classification report
-  - 5-fold file-level cross-validated ROC-AUC (mean and standard deviation)
+  - accuracy, ROC-AUC, and classification report on the speaker-held-out test set
 
-## 6) Baseline results
+## 6) Results
 
-Example baseline results from a typical run (exact values may vary):
+Representative results from a speaker-level split (exact values vary depending on the held-out speakers):
 
-- Feature matrix shape: ~`(17632, 26)`
-- Accuracy: ~`0.93`
-- ROC-AUC (held-out split): ~`0.98`
-- File-level CV ROC-AUC (5-fold): ~`0.86–0.87`
+- Feature matrix shape: ~`(17k, 26)`
+- Accuracy: ~`0.55–0.65`
+- ROC-AUC: typically below file-level baselines
 
-These results should be treated as an **optimistic baseline**.
+Performance is substantially lower than file-level splits, reflecting the difficulty of speaker-independent dysarthria detection with a limited number of speakers.
 
 ## 7) Limitations and future work
 
-### Speaker leakage
+### Limited number of speakers
 
-The current evaluation uses a **file-level split**, meaning the same speaker can appear in both training and test sets. This can inflate performance because the model may learn speaker-specific characteristics rather than dysarthria-related patterns.
-
-As a result, the reported accuracy and ROC-AUC do **not** reflect true speaker-independent generalization.
+TORGO contains a small number of speakers, which leads to high variance in speaker-level evaluation. Results depend strongly on which speakers are held out.
 
 ### Future directions
 
-- Speaker-level or leave-one-speaker-out (LOSO) evaluation.
-- Stronger controls for speaker and session confounds.
+- Leave-One-Speaker-Out (LOSO) evaluation for fully speaker-independent testing.
+- Stronger acoustic features (e.g., delta and delta-delta MFCCs).
+- Group-aware cross-validation (e.g., `GroupKFold`).
 - Cross-dataset evaluation (e.g., combining TORGO with UASpeech).
-- Exploring more speaker-invariant representations.
+- Exploration of speaker-invariant representations or domain adaptation.
 
 ## 8) Repository structure
 
 ```text
 .
-├── main.py    # End-to-end baseline: download → checks → MFCCs → SVM
+├── main.py    # End-to-end pipeline: download → checks → MFCCs → speaker-level SVM
 └── README.md
 ```

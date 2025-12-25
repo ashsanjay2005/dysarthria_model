@@ -5,8 +5,10 @@ import numpy as np
 import os
 import random
 import re
+from collections import defaultdict
 
-from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+
+
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 from sklearn.metrics import accuracy_score, classification_report, roc_auc_score
@@ -16,6 +18,8 @@ from sklearn.metrics import accuracy_score, classification_report, roc_auc_score
 # - Runs lightweight dataset checks (speaker overlap, mic distribution, random quality scan)
 # - Extracts MFCC summary features per utterance
 # - Trains and evaluates an SVM classifier (file-level split) as an initial baseline
+# - Safely load a wav file at a fixed sample rate.
+# - Returns (None, None) if loading fails or the file is empty.
 
 
 def safe_load_wav(fp: str):
@@ -29,6 +33,8 @@ def safe_load_wav(fp: str):
     except Exception:
         return None, None
 
+# Extract 13 MFCCs per file and summarize over time using mean and standard deviation.
+# Final feature dimension: 26 per utterance.
 def extract_mfcc_features(fp: str, n_mfcc: int = 13):
     y, sr = safe_load_wav(fp)
     if y is None or sr is None:
@@ -57,13 +63,15 @@ def main():
                     wavs.append(os.path.join(root, f))
         print(group, "wav files:", len(wavs))
 
-    # Dataset-level metadata checks (no audio decoding): speaker IDs and microphone types.
+    # Dataset-level metadata checks (no audio decoding).
+    # Used to verify speaker separation and inspect microphone distributions.
     print("\n=== Confound checks (dataset-level) ===")
 
 
     # Speaker ID is encoded in folder names like: wav_headMic_FC02S03 (speaker FC02, session S03).
     speaker_re = re.compile(r"wav_(?:headMic|arrayMic)_(?P<code>[FM]C?\d{2})S\d{2}")
 
+    # Extract speaker ID from directory names (e.g., wav_headMic_FC02S03 → FC02).
     def parse_speaker_id_from_path(fp: str) -> str | None:
         # Expected folder: .../<GROUP>/wav_headMic_FC02S03/<file>.wav
         parts = fp.split(os.sep)
@@ -73,6 +81,7 @@ def main():
                 return m.group("code")
         return None
 
+    # Infer microphone type from the directory name.
     def parse_mic_from_path(fp: str) -> str | None:
         # Returns 'headMic' or 'arrayMic' if present
         if f"wav_headMic_" in fp:
@@ -223,7 +232,7 @@ def main():
             for reason, fp in flagged_examples[:5]:
                 print("   -", reason, "::", fp)
 
-    print("\nTip: If you see lots of clipped or near-silent files, we can filter them before feature extraction.")
+ 
 
     # --- SVM Training and Evaluation ---
     print("\n=== SVM Training (MFCC features) ===")
@@ -239,24 +248,61 @@ def main():
         "M_Dys": 1
     }
 
+    # Split data by speaker so that no speaker appears in both train and test.
+    print("\n=== Speaker-level split ===")
+
+    # Build a parallel speaker list aligned to X/y so we can split by speaker.
+    speakers = []
+    for group, files in group_to_files.items():
+        for fp in files:
+            spk = parse_speaker_id_from_path(fp)
+            if spk is not None:
+                speakers.append(spk)
+            else:
+                # Keep alignment by adding a placeholder; these rows may be skipped if features are None.
+                speakers.append(None)
+
+    # Rebuild feature, label, and speaker arrays together to ensure proper alignment
+    # after skipping files with missing features or speaker IDs.
+    X_list, y_list, spk_list = [], [], []
     for group, files in group_to_files.items():
         label = label_map[group]
         for fp in files:
+            spk = parse_speaker_id_from_path(fp)
             feats = extract_mfcc_features(fp)
-            if feats is not None:
-                X.append(feats)
-                y.append(label)
+            if feats is None or spk is None:
+                continue
+            X_list.append(feats)
+            y_list.append(label)
+            spk_list.append(spk)
 
-    X = np.array(X)
-    y = np.array(y)
+    X = np.array(X_list)
+    y = np.array(y_list)
+    speakers = np.array(spk_list)
 
     print("Feature matrix shape:", X.shape)
 
-    # File-level split (speakers appear in both train and test).
-    # May be prone to speaker leakage
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, stratify=y, random_state=42
-    )
+    # Map each speaker ID to the indices of its utterances.
+    speaker_to_indices = defaultdict(list)
+    for i, spk in enumerate(speakers):
+        speaker_to_indices[spk].append(i)
+
+    unique_speakers = list(speaker_to_indices.keys())
+    random.seed(42)
+    random.shuffle(unique_speakers)
+
+    split_idx = int(0.8 * len(unique_speakers))
+    train_speakers = set(unique_speakers[:split_idx])
+    test_speakers = set(unique_speakers[split_idx:])
+
+    train_idx = [i for spk in train_speakers for i in speaker_to_indices[spk]]
+    test_idx = [i for spk in test_speakers for i in speaker_to_indices[spk]]
+
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+
+    print(f"Train speakers: {len(train_speakers)} | Test speakers: {len(test_speakers)}")
+    print(f"Train samples: {len(X_train)} | Test samples: {len(X_test)}")
 
     scaler = StandardScaler()
     X_train = scaler.fit_transform(X_train)
@@ -271,14 +317,6 @@ def main():
     print("Accuracy:", accuracy_score(y_test, y_pred))
     print("ROC-AUC:", roc_auc_score(y_test, y_scores))
     print(classification_report(y_test, y_pred))
-
-    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    cv_scores = cross_val_score(
-        svm, X, y, cv=cv, scoring="roc_auc"
-    )
-
-    print("CV ROC-AUC mean:", cv_scores.mean())
-    print("CV ROC-AUC std:", cv_scores.std())
 
 if __name__ == "__main__":
     main()
