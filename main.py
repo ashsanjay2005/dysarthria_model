@@ -1,23 +1,21 @@
 import kagglehub
 import librosa
-import matplotlib.pyplot as plt
 import numpy as np
 import os
 import random
 import re
 from collections import defaultdict
 
-
-
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 from sklearn.metrics import accuracy_score, classification_report, roc_auc_score
+from sklearn.model_selection import StratifiedKFold
 
 # TORGO dysarthria baseline:
 # - Downloads the dataset via kagglehub
 # - Runs lightweight dataset checks (speaker overlap, mic distribution, random quality scan)
 # - Extracts MFCC summary features per utterance
-# - Trains and evaluates an SVM classifier (file-level split) as an initial baseline
+# - Trains and evaluates an SVM classifier as an initial baseline
 # - Safely load a wav file at a fixed sample rate.
 # - Returns (None, None) if loading fails or the file is empty.
 
@@ -33,16 +31,37 @@ def safe_load_wav(fp: str):
     except Exception:
         return None, None
 
-# Extract 13 MFCCs per file and summarize over time using mean and standard deviation.
-# Final feature dimension: 26 per utterance.
-def extract_mfcc_features(fp: str, n_mfcc: int = 13):
+# Extract MFCC-based features per utterance and summarize over time using mean and standard deviation.
+# We include MFCC, delta, and delta-delta coefficients.
+# Final feature dimension: 78 per utterance.
+def extract_mfcc_features(fp: str, n_mfcc: int = 13, min_len_samples: int = 2048):
     y, sr = safe_load_wav(fp)
     if y is None or sr is None:
         return None
+
+    # Very short clips can fail MFCC and delta computations.
+    # Skip them rather than silently producing unstable features.
+    if len(y) < min_len_samples:
+        return None
+
     mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
-    mfcc_mean = np.mean(mfcc, axis=1)
-    mfcc_std = np.std(mfcc, axis=1)
-    return np.concatenate([mfcc_mean, mfcc_std])
+
+    # Delta features require enough time frames. Use a smaller window on short signals.
+    n_frames = mfcc.shape[1]
+    width = min(9, n_frames)
+    if width % 2 == 0:
+        width -= 1
+    if width < 3:
+        return None
+
+    delta = librosa.feature.delta(mfcc, width=width, mode="nearest")
+    delta2 = librosa.feature.delta(mfcc, order=2, width=width, mode="nearest")
+
+    feats = np.vstack([mfcc, delta, delta2])
+
+    feat_mean = np.mean(feats, axis=1)
+    feat_std = np.std(feats, axis=1)
+    return np.concatenate([feat_mean, feat_std])
 
 def main():
     path = kagglehub.dataset_download("pranaykoppula/torgo-audio")
@@ -281,6 +300,8 @@ def main():
     speakers = np.array(spk_list)
 
     print("Feature matrix shape:", X.shape)
+    # With delta and delta-delta enabled, features are 78-D per utterance:
+    # (13 MFCC + 13 delta + 13 delta-delta) * (mean + std).
 
     # Map each speaker ID to the indices of its utterances.
     speaker_to_indices = defaultdict(list)
@@ -317,6 +338,88 @@ def main():
     print("Accuracy:", accuracy_score(y_test, y_pred))
     print("ROC-AUC:", roc_auc_score(y_test, y_scores))
     print(classification_report(y_test, y_pred))
+
+    print("\n=== File-level CV (StratifiedKFold) ===")
+    print("Note: This CV is file-level, so it may still include speaker leakage.")
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+    cv_acc = []
+    cv_auc = []
+
+    for tr_idx, te_idx in skf.split(X, y):
+        X_tr, X_te = X[tr_idx], X[te_idx]
+        y_tr, y_te = y[tr_idx], y[te_idx]
+
+        sc = StandardScaler()
+        X_tr = sc.fit_transform(X_tr)
+        X_te = sc.transform(X_te)
+
+        m = SVC(kernel="rbf", C=1.0, gamma="scale")
+        m.fit(X_tr, y_tr)
+
+        p = m.predict(X_te)
+        s = m.decision_function(X_te)
+
+        cv_acc.append(accuracy_score(y_te, p))
+        cv_auc.append(roc_auc_score(y_te, s))
+
+    print(f"CV Accuracy: {np.mean(cv_acc):.3f} ± {np.std(cv_acc):.3f}")
+    print(f"CV ROC-AUC: {np.mean(cv_auc):.3f} ± {np.std(cv_auc):.3f}")
+
+    # Leave-One-Speaker-Out (LOSO) evaluation.
+    # This is the strictest check in this script: each run holds out one speaker
+    # entirely and trains on all remaining speakers.
+    print("\n=== LOSO Evaluation (Speaker-Independent) ===")
+
+    loso_accs = []
+    loso_aucs = []
+
+    # Loop over speakers and treat each one as the test set once.
+    for test_spk in sorted(set(speakers)):
+        # Split by speaker: all utterances for test_spk go to test, the rest go to train.
+        tr_idx = [i for i, spk in enumerate(speakers) if spk != test_spk]
+        te_idx = [i for i, spk in enumerate(speakers) if spk == test_spk]
+
+        if not te_idx:
+            continue
+
+        X_tr, X_te = X[tr_idx], X[te_idx]
+        y_tr, y_te = y[tr_idx], y[te_idx]
+
+        # Fit normalization on the training speakers only, then apply it to the held-out speaker.
+        sc = StandardScaler()
+        X_tr = sc.fit_transform(X_tr)
+        X_te = sc.transform(X_te)
+
+        # Train a fresh model for this held-out speaker.
+        m = SVC(kernel="rbf", C=1.0, gamma="scale")
+        m.fit(X_tr, y_tr)
+
+        p = m.predict(X_te)
+        s = m.decision_function(X_te)
+
+        # Track accuracy per held-out speaker to see how much results vary by person.
+        acc = accuracy_score(y_te, p)
+        loso_accs.append(acc)
+
+        # Many speakers only belong to one label group, so their test set may be single-class.
+        # In that case ROC-AUC is not defined and we report NA.
+        # AUC is only defined if the held-out speaker contains both classes.
+        auc = None
+        if len(set(y_te)) == 2:
+            auc = roc_auc_score(y_te, s)
+            loso_aucs.append(auc)
+
+        if auc is None:
+            print(f"Speaker {test_spk}: samples={len(te_idx)} | acc={acc:.3f} | auc=NA")
+        else:
+            print(f"Speaker {test_spk}: samples={len(te_idx)} | acc={acc:.3f} | auc={auc:.3f}")
+
+    # Aggregate across speakers. The standard deviation is usually large on TORGO
+    # because there are few speakers and some are much harder than others.
+    print(f"LOSO mean accuracy: {np.mean(loso_accs):.3f} ± {np.std(loso_accs):.3f}")
+    if loso_aucs:
+        print(f"LOSO mean ROC-AUC: {np.mean(loso_aucs):.3f} ± {np.std(loso_aucs):.3f}")
 
 if __name__ == "__main__":
     main()
