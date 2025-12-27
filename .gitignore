@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS
+.DS_Store
+
+# Old output folders (do not track)
+out/
+out_ua/
+out_v2/
+out_ua_v2/
+
+# Optional: do not track raw per-seed CSVs if they are too large
+# out_torgo_v3/
+# out_ua_v3/
+
+# Do not track the huge combined file
+out_summary/all_rows.csv
+
+# Keep aggregated summaries + figures tracked
+!out_summary/speaker_summary.csv
+!out_summary/utterance_summary.csv
+!out_summary/figures/
+!out_summary/figures/*.png
