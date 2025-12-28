@@ -24,3 +24,18 @@ out_summary/all_rows.csv
 !out_summary/utterance_summary.csv
 !out_summary/figures/
 !out_summary/figures/*.png
+
+# Progress tracker outputs (generated, user-specific)
+progress_scores.jsonl
+progress_state.json
+
+# Trained model artifacts (usually too big for git; use Git LFS if you want to publish)
+*.joblib
+
+# KaggleHub / dataset caches (if they ever land in the repo)
+.cache/
+**/.cache/
+
+# Notebook / misc outputs
+*.log
+*.tmp

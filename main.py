@@ -12,6 +12,8 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 from sklearn.metrics import accuracy_score, classification_report, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
+from sklearn.pipeline import Pipeline
+import joblib
 
 
 # TORGO dysarthria baseline:
@@ -183,6 +185,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Output CSV path for --export-scores.",
     )
 
+    p.add_argument(
+        "--save-model",
+        action="store_true",
+        help="Save the trained model (scaler(s) + SVM) to a joblib file.",
+    )
+    p.add_argument(
+        "--model-out",
+        type=str,
+        default="models/svm_mfcc.joblib",
+        help="Output path for --save-model (default: models/svm_mfcc.joblib).",
+    )
     return p
 
 
@@ -558,6 +571,58 @@ def export_scores_csv(
     print(f"Wrote scores CSV: {out_path}")
 
 
+# --- Serializable wrapper for per-domain scaling + SVM ---
+class PerDomainScaledSVM:
+    """A lightweight, joblib-serializable wrapper for per-dataset scaling + SVM.
+
+    This supports inference-time feature scaling by dataset domain label.
+    Domains are expected to be strings like "TORGO" or "UASPEECH".
+
+    If a domain is unseen at inference time, it falls back to the global scaler.
+    """
+
+    def __init__(
+        self,
+        svm: SVC,
+        scalers: dict[str, StandardScaler],
+        global_scaler: StandardScaler,
+        feature_dim: int,
+    ):
+        self.svm = svm
+        self.scalers = scalers
+        self.global_scaler = global_scaler
+        self.feature_dim = feature_dim
+
+    def _scale(self, X: np.ndarray, domains: np.ndarray | None):
+        if domains is None:
+            return self.global_scaler.transform(X)
+
+        X_out = np.zeros_like(X)
+        used_any = False
+        for dom in sorted(set(domains)):
+            mask = domains == dom
+            sc = self.scalers.get(dom)
+            if sc is None:
+                # unseen domain: use global
+                X_out[mask] = self.global_scaler.transform(X[mask])
+            else:
+                X_out[mask] = sc.transform(X[mask])
+                used_any = True
+
+        if not used_any:
+            X_out = self.global_scaler.transform(X)
+
+        return X_out
+
+    def decision_function(self, X: np.ndarray, domains: np.ndarray | None = None):
+        Xs = self._scale(X, domains)
+        return self.svm.decision_function(Xs)
+
+    def predict(self, X: np.ndarray, domains: np.ndarray | None = None):
+        Xs = self._scale(X, domains)
+        return self.svm.predict(Xs)
+
+
 
 
 def run_speaker_split_train(
@@ -572,6 +637,8 @@ def run_speaker_split_train(
     balance_domains: bool,
     export_scores: bool,
     scores_out: str,
+    save_model: bool,
+    model_out: str,
 ):
     print("\n=== SVM Training (MFCC features) ===")
     print("\n=== Speaker-level split ===")
@@ -603,23 +670,61 @@ def run_speaker_split_train(
         keep = balance_domains_indices(dom_train, seed=seed)
         X_train, y_train, dom_train = X_train[keep], y_train[keep], dom_train[keep]
 
+    # Train model
     if per_dataset_scale:
-        X_train, X_test = fit_transform_per_domain(X_train, X_test, dom_train, dom_test)
+        # Fit scalers per domain on training only, and also fit a global fallback.
+        scalers: dict[str, StandardScaler] = {}
+        X_train_scaled = np.zeros_like(X_train)
+        for dom in sorted(set(dom_train)):
+            mask = dom_train == dom
+            sc = StandardScaler()
+            X_train_scaled[mask] = sc.fit_transform(X_train[mask])
+            scalers[dom] = sc
+
+        global_scaler = StandardScaler()
+        global_scaler.fit(X_train)
+
+        svm = SVC(kernel="rbf", C=1.0, gamma="scale")
+        svm.fit(X_train_scaled, y_train)
+
+        # Scale test with per-domain scalers when available, else global.
+        X_test_scaled = np.zeros_like(X_test)
+        for dom in sorted(set(dom_test)):
+            mask = dom_test == dom
+            sc = scalers.get(dom)
+            if sc is None:
+                X_test_scaled[mask] = global_scaler.transform(X_test[mask])
+            else:
+                X_test_scaled[mask] = sc.transform(X_test[mask])
+
+        y_pred = svm.predict(X_test_scaled)
+        y_scores = svm.decision_function(X_test_scaled)
+
+        model_obj: object = PerDomainScaledSVM(
+            svm=svm,
+            scalers=scalers,
+            global_scaler=global_scaler,
+            feature_dim=X_train.shape[1],
+        )
+
     else:
         scaler = StandardScaler()
-        X_train = scaler.fit_transform(X_train)
-        X_test = scaler.transform(X_test)
+        svm = SVC(kernel="rbf", C=1.0, gamma="scale")
+        model_obj = Pipeline([("scaler", scaler), ("svm", svm)])
+        model_obj.fit(X_train, y_train)
 
-
-    svm = SVC(kernel="rbf", C=1.0, gamma="scale")
-    svm.fit(X_train, y_train)
-
-    y_pred = svm.predict(X_test)
-    y_scores = svm.decision_function(X_test)
+        y_pred = model_obj.predict(X_test)
+        # Pipeline exposes decision_function via final estimator
+        y_scores = model_obj.decision_function(X_test)
 
     print("Accuracy:", accuracy_score(y_test, y_pred))
     print("ROC-AUC:", roc_auc_score(y_test, y_scores))
     print(classification_report(y_test, y_pred))
+
+    if save_model:
+        os.makedirs(os.path.dirname(model_out) or ".", exist_ok=True)
+        joblib.dump(model_obj, model_out)
+        print(f"Saved model: {model_out}")
 
     if export_scores:
         export_scores_csv(
@@ -867,6 +972,8 @@ def main():
             balance_domains=args.balance_domains,
             export_scores=args.export_scores,
             scores_out=args.scores_out,
+            save_model=args.save_model,
+            model_out=args.model_out,
         )
 
     if args.file_cv:
